@@ -6,10 +6,11 @@ var path = require( "path" );
 var utils = require( './utils.js' );
 var icons = require( './icons.js' );
 var config = require( './config.js' );
-var highlights = require( './highlights.js' );
 
+var initialized = false;
 var workspaceFolders;
 var nodes = [];
+var currentFilter;
 
 const PATH = "path";
 const TODO = "todo";
@@ -21,7 +22,7 @@ var expandedNodes = {};
 
 var isVisible = function( e )
 {
-    return e.visible === true;
+    return e.visible === true && e.hidden !== true;
 };
 
 var findTagNode = function( node )
@@ -45,22 +46,34 @@ var findPathNode = function( node )
 
 var findTodoNode = function( node )
 {
-    return node.label === this.label.toString() && node.line === this.line;
+    return node.label === this.label.toString() && node.fsPath === this.fsPath && node.line === this.line;
+};
+
+var sortFoldersFirst = function( a, b, same )
+{
+    if( a.isFolder === b.isFolder )
+    {
+        return same( a, b );
+    }
+    else
+    {
+        return b.isFolder ? 1 : -1;
+    }
 };
 
 var sortByLabelAndLine = function( a, b )
 {
-    return a.label > b.label ? 1 : b.label > a.label ? -1 : a.line > b.line ? 1 : -1;
+    return sortFoldersFirst( a, b, function( a, b ) { return a.label > b.label ? 1 : b.label > a.label ? -1 : a.line > b.line ? 1 : -1; } );
 };
 
 var sortByFilenameAndLine = function( a, b )
 {
-    return a.fsPath > b.fsPath ? 1 : b.fsPath > a.fsPath ? -1 : a.line > b.line ? 1 : -1;
+    return sortFoldersFirst( a, b, function( a, b ) { return a.fsPath > b.fsPath ? 1 : b.fsPath > a.fsPath ? -1 : a.line > b.line ? 1 : -1; } );
 };
 
 var sortByTagAndLine = function( a, b )
 {
-    return a.tag > b.tag ? 1 : b.tag > a.tag ? -1 : a.line > b.line ? 1 : -1;
+    return sortFoldersFirst( a, b, function( a, b ) { return a.tag > b.tag ? 1 : b.tag > a.tag ? -1 : a.line > b.line ? 1 : -1; } );
 };
 
 function createWorkspaceRootNode( folder )
@@ -74,11 +87,12 @@ function createWorkspaceRootNode( folder )
         todos: [],
         fsPath: folder.uri.fsPath,
         id: id,
-        visible: true
+        visible: true,
+        isFolder: true
     };
 }
 
-function createPathNode( folder, pathElements )
+function createPathNode( folder, pathElements, isFolder )
 {
     var id = ( buildCounter * 1000000 ) + nodeCounter++;
     var fsPath = pathElements.length > 0 ? path.join( folder, pathElements.join( path.sep ) ) : folder;
@@ -91,7 +105,8 @@ function createPathNode( folder, pathElements )
         nodes: [],
         todos: [],
         id: id,
-        visible: true
+        visible: true,
+        isFolder: isFolder
     };
 }
 
@@ -133,24 +148,27 @@ function createTodoNode( result )
 {
     var id = ( buildCounter * 1000000 ) + nodeCounter++;
     var text = utils.removeBlockComments( result.match.substr( result.column - 1 ), result.file );
-    var extracted = utils.extractTag( text );
-    var label = extracted.withoutTag ? extracted.withoutTag : "line " + result.line;
+    var extracted = utils.extractTag( text, result.column );
+    var label = ( extracted.withoutTag && extracted.withoutTag.length > 0 ) ? extracted.withoutTag : "line " + result.line;
 
     if( config.shouldGroup() !== true )
     {
         label = extracted.tag + " " + label;
     }
 
+    var tagGroup = config.tagGroup( extracted.tag );
+
     var todo = {
         type: TODO,
         fsPath: result.file,
         label: label,
-        tag: extracted.tag,
+        tag: tagGroup ? tagGroup : extracted.tag,
+        actualTag: extracted.tag,
         line: result.line - 1,
         column: result.column,
         endColumn: result.column + result.match.length,
-        after: extracted.withoutTag.trim(),
-        before: result.match.substring( 0, result.column - 1 ).trim(),
+        after: extracted.after ? extracted.after.trim() : "",
+        before: extracted.before ? extracted.before.trim() : "",
         id: id,
         visible: true,
         extraLines: []
@@ -169,12 +187,12 @@ function createTodoNode( result )
     return todo;
 }
 
-function locateWorkspaceNode( nodes, filename )
+function locateWorkspaceNode( filename )
 {
     var result;
     nodes.map( function( node )
     {
-        if( node.isWorkspaceNode && filename.indexOf( node.fsPath ) === 0 )
+        if( node.isWorkspaceNode && ( filename === node.fsPath || filename.indexOf( node.fsPath + path.sep ) === 0 ) )
         {
             result = node;
         }
@@ -233,7 +251,7 @@ function locateTreeChildNode( rootNode, pathElements, tag )
         childNode = parentNodes.find( findPathNode, element );
         if( childNode === undefined )
         {
-            childNode = createPathNode( rootNode.fsPath, pathElements.slice( 0, level + 1 ) );
+            childNode = createPathNode( rootNode.fsPath, pathElements.slice( 0, level + 1 ), level < pathElements.length - 1 );
             parentNodes.push( childNode );
             parentNodes.sort( sortByLabelAndLine );
             parentNodes = childNode.nodes;
@@ -247,24 +265,38 @@ function locateTreeChildNode( rootNode, pathElements, tag )
     return childNode;
 }
 
-function countTags( child, tagCounts )
+function countTags( child, tagCounts, forStatusBar, fileFilter )
 {
+    function countTag( node )
+    {
+        if( node.type === TODO )
+        {
+            var tag = node.tag ? node.tag : "TODO";
+            if( isVisible( node ) && ( !fileFilter || fileFilter === node.fsPath ) )
+            {
+                if( !forStatusBar || !config.shouldHideFromStatusBar( tag ) )
+                {
+                    tagCounts[ tag ] = tagCounts[ tag ] === undefined ? 1 : tagCounts[ tag ] + 1;
+                }
+            }
+        }
+    }
+
+    countTag( child );
+
     if( child.nodes !== undefined )
     {
-        countChildTags( child.nodes, tagCounts );
+        countChildTags( child.nodes, tagCounts, forStatusBar, fileFilter );
     }
     if( child.todos )
     {
-        child.todos.map( function( todo )
-        {
-            tagCounts[ todo.tag ] = tagCounts[ todo.tag ] === undefined ? 1 : tagCounts[ todo.tag ] + 1;
-        } );
+        child.todos.map( function( node ) { countTag( node ); } );
     }
 }
 
-function countChildTags( children, tagCounts )
+function countChildTags( children, tagCounts, forStatusBar, fileFilter )
 {
-    children.map( function( child ) { return countTags( child, tagCounts ); } );
+    children.map( function( child ) { return countTags( child, tagCounts, forStatusBar, fileFilter ); } );
     return tagCounts;
 }
 
@@ -297,6 +329,8 @@ class TreeNodeProvider
     {
         if( node === undefined )
         {
+            var result = [];
+
             var availableNodes = nodes.filter( function( node )
             {
                 return node.nodes === undefined || ( node.nodes.length + ( node.todos ? node.todos.length : 0 ) > 0 );
@@ -311,13 +345,66 @@ class TreeNodeProvider
                         return a.name > b.name;
                     } );
                 }
-                return rootNodes;
+                result = rootNodes;
             }
 
-            return [ { label: "Nothing found", empty: availableNodes.length === 0 } ];
+            var statusNode = { label: "", notExported: true };
+            var includeGlobs = this._context.workspaceState.get( 'includeGlobs' ) || [];
+            var excludeGlobs = this._context.workspaceState.get( 'excludeGlobs' ) || [];
+            var totalFilters = includeGlobs.length + excludeGlobs.length;
+            var tooltip = "";
+
+            if( currentFilter )
+            {
+                tooltip += "Global: \"" + currentFilter + "\"\n";
+                totalFilters++;
+            }
+
+            if( includeGlobs.length + excludeGlobs.length > 0 )
+            {
+                includeGlobs.map( function( glob )
+                {
+                    tooltip += "Include: " + glob + "\n";
+                } );
+                excludeGlobs.map( function( glob )
+                {
+                    tooltip += "Exclude: " + glob + "\n";
+                } );
+            }
+
+            if( totalFilters > 0 )
+            {
+                statusNode.label = totalFilters + " filter" + ( totalFilters === 1 ? '' : 's' ) + " active";
+                statusNode.tooltip = tooltip + "\nRight click for filter options";
+            }
+
+            if( result.length === 0 )
+            {
+                if( statusNode.label === "" )
+                {
+                    statusNode.label += "Nothing found";
+                }
+
+                statusNode.empty = availableNodes.length === 0;
+            }
+
+            if( statusNode.label !== "" )
+            {
+                result.unshift( statusNode );
+            }
+
+            return result;
         }
         else if( node.type === PATH )
         {
+            if( config.shouldCompactFolders() )
+            {
+                while( node.nodes && node.nodes.length === 1 && node.nodes[ 0 ].nodes.length > 0 )
+                {
+                    node = node.nodes[ 0 ];
+                }
+            }
+
             if( node.nodes && node.nodes.length > 0 )
             {
                 return node.nodes.filter( isVisible );
@@ -370,18 +457,30 @@ class TreeNodeProvider
                 treeItem.resourceUri = vscode.Uri.file( node.fsPath );
             }
 
-            treeItem.tooltip = node.fsPath;
-            if( node.line !== undefined )
+            if( treeItem.node.type === TODO )
             {
-                treeItem.tooltip += ", line " + ( node.line + 1 );
-                if( config.shouldShowLineNumbers() )
-                {
-                    treeItem.label = "Line " + ( node.line + 1 ) + ":" + treeItem.label;
-                }
+                treeItem.tooltip = config.tooltipFormat();
+                treeItem.tooltip = utils.formatLabel( config.tooltipFormat(), node );
+            }
+            else
+            {
+                treeItem.tooltip = treeItem.fsPath;
             }
 
             if( node.type === PATH )
             {
+                if( config.shouldCompactFolders() )
+                {
+                    var onlyChild = node.nodes.length === 1 ? node.nodes[ 0 ] : undefined;
+                    var onlyChildParent = node;
+                    while( onlyChild && onlyChild.nodes.length > 0 && onlyChildParent.nodes.length === 1 )
+                    {
+                        treeItem.label += "/" + onlyChild.label;
+                        onlyChildParent = onlyChild;
+                        onlyChild = onlyChild.nodes[ 0 ];
+                    }
+                }
+
                 if( expandedNodes[ node.fsPath ] !== undefined )
                 {
                     treeItem.collapsibleState = ( expandedNodes[ node.fsPath ] === true ) ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed;
@@ -410,13 +509,17 @@ class TreeNodeProvider
                 {
                     treeItem.collapsibleState = vscode.TreeItemCollapsibleState.Expanded;
                 }
-                if( node.isExtraLine !== true )
+
+                if( config.shouldHideIconsWhenGroupedByTag() !== true || config.shouldGroup() !== true )
                 {
-                    treeItem.iconPath = icons.getIcon( this._context, node.tag ? node.tag : node.label );
-                }
-                else
-                {
-                    treeItem.iconPath = "no-icon";
+                    if( node.isExtraLine !== true )
+                    {
+                        treeItem.iconPath = icons.getIcon( this._context, node.tag ? node.tag : node.label );
+                    }
+                    else
+                    {
+                        treeItem.iconPath = "no-icon";
+                    }
                 }
 
                 var format = config.labelFormat();
@@ -437,13 +540,24 @@ class TreeNodeProvider
                 };
             }
         }
+        else
+        {
+            treeItem.description = node.label;
+            treeItem.label = "";
+            treeItem.tooltip = node.tooltip;
+        }
 
         if( config.shouldShowCounts() && node.type === PATH )
         {
             var tagCounts = {};
-            countTags( node, tagCounts );
+            countTags( node, tagCounts, false );
             var total = Object.values( tagCounts ).reduce( function( a, b ) { return a + b; }, 0 );
             treeItem.description = total.toString();
+        }
+
+        if( node.isFolder )
+        {
+            treeItem.contextValue = "folder";
         }
 
         return treeItem;
@@ -460,6 +574,7 @@ class TreeNodeProvider
 
     rebuild()
     {
+        initialized = true;
         buildCounter = ( buildCounter + 1 ) % 100;
     }
 
@@ -486,6 +601,7 @@ class TreeNodeProvider
 
         if( children === undefined )
         {
+            currentFilter = text;
             children = nodes;
         }
         children.forEach( child =>
@@ -520,6 +636,8 @@ class TreeNodeProvider
 
     clearFilter( children )
     {
+        currentFilter = undefined;
+
         if( children === undefined )
         {
             children = nodes;
@@ -549,12 +667,12 @@ class TreeNodeProvider
             addWorkspaceFolders();
         }
 
-        var rootNode = locateWorkspaceNode( nodes, result.file );
+        var rootNode = locateWorkspaceNode( result.file );
         var todoNode = createTodoNode( result );
 
-        if( highlights.shouldHideFromTree( todoNode.tag ? todoNode.tag : todoNode.label ) )
+        if( config.shouldHideFromTree( todoNode.tag ? todoNode.tag : todoNode.label ) )
         {
-            return;
+            todoNode.hidden = true;
         }
 
         var childNode;
@@ -665,7 +783,7 @@ class TreeNodeProvider
         }
     }
 
-    remove( filename, children )
+    remove( callback, filename, children )
     {
         function removeNodesByFilename( children, me )
         {
@@ -673,13 +791,17 @@ class TreeNodeProvider
             {
                 if( child.nodes !== undefined )
                 {
-                    child.nodes = me.remove( filename, child.nodes );
+                    child.nodes = me.remove( callback, filename, child.nodes );
                 }
                 var shouldRemove = ( child.fsPath === filename );
                 if( shouldRemove )
                 {
                     delete expandedNodes[ child.fsPath ];
                     me._context.workspaceState.update( 'expandedNodes', expandedNodes );
+                    if( callback )
+                    {
+                        callback( child.fsPath );
+                    }
                 }
                 return shouldRemove === false;
             }, me );
@@ -691,13 +813,17 @@ class TreeNodeProvider
             {
                 if( child.nodes !== undefined )
                 {
-                    child.nodes = me.remove( filename, child.nodes );
+                    child.nodes = me.remove( callback, filename, child.nodes );
                 }
                 var shouldRemove = ( child.nodes && child.todos && child.nodes.length + child.todos.length === 0 && child.isWorkspaceNode !== true );
                 if( shouldRemove )
                 {
                     delete expandedNodes[ child.fsPath ];
                     me._context.workspaceState.update( 'expandedNodes', expandedNodes );
+                    if( callback )
+                    {
+                        callback( child.fsPath );
+                    }
                 }
                 return shouldRemove !== true;
             }, me );
@@ -751,11 +877,59 @@ class TreeNodeProvider
         this._context.workspaceState.update( 'expandedNodes', expandedNodes );
     }
 
-    getTagCounts()
+    getTagCountsForStatusBar( fileFilter )
     {
         var tagCounts = {};
-        return countChildTags( nodes, tagCounts );
+        return countChildTags( nodes, tagCounts, true, fileFilter );
+    }
+
+    exportChildren( parent, children )
+    {
+        children.forEach( function( child )
+        {
+            if( child.type === PATH )
+            {
+                parent[ child.label ] = {};
+                this.exportChildren( parent[ child.label ], this.getChildren( child ) );
+            }
+            else if( !child.notExported )
+            {
+                var format = config.labelFormat();
+                var itemLabel = "line " + ( child.line + 1 );
+                if( config.shouldShowTagsOnly() === true )
+                {
+                    itemLabel = child.fsPath + " " + itemLabel;
+                }
+                parent[ itemLabel ] = ( format !== "" ) ?
+                    utils.formatLabel( format, child ) + ( child.pathLabel ? ( " " + child.pathLabel ) : "" ) :
+                    child.label;
+            }
+        }, this );
+        return parent;
+    }
+
+    exportTree()
+    {
+        var exported = {};
+        var children = this.getChildren();
+        exported = this.exportChildren( exported, children );
+        return exported;
+    }
+
+    getFirstNode()
+    {
+        var availableNodes = nodes.filter( function( node )
+        {
+            return node.nodes === undefined || ( node.nodes.length + ( node.todos ? node.todos.length : 0 ) > 0 );
+        } );
+        var rootNodes = availableNodes.filter( isVisible );
+        if( rootNodes.length > 0 )
+        {
+            return rootNodes[ 0 ];
+        }
+        return undefined;
     }
 }
 
 exports.TreeNodeProvider = TreeNodeProvider;
+exports.locateWorkspaceNode = locateWorkspaceNode;
